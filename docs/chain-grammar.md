@@ -114,7 +114,9 @@ body cannot amplify work to O(references × body size).
   into the request that is actually sent (that is the point of chaining) but
   must never appear in derived/rendered surfaces: the VS Code extension
   redacts them from EVERY string field of the rendered request echo (url,
-  header values, and body) as `[REDACTED]`, and adapters get per-send
+  header values, and body) with a secret-free marker (normally
+  `[REDACTED]`; a deterministic fallback is used when that marker itself
+  contains an active secret), and adapters get per-send
   redaction material (`resolvedSecrets` / `resolvedSecretNames` from
   `prepareChainSend`) to enforce the same boundary for hovers, history,
   exports, and clipboard output. Redaction provenance is VALUE-EQUALITY
@@ -130,19 +132,39 @@ body cannot amplify work to O(references × body size).
   of template secrets). The recorded request body is the scrubbed copy, not
   the raw wire body, so a `{{name.request.body.$…}}` reference can never
   re-surface a secret after the environment rotates. The store scrub is
-  JSON-aware: for a JSON body, string leaves are masked textually while
-  non-string scalars are masked only on exact equality with a secret, so
-  the recorded copy stays parseable and references to UNRELATED fields keep
-  working (residual: an unquoted scalar secret appearing only as a
-  substring of a larger scalar survives in the store copy — prefer quoting
-  secrets in JSON bodies). Persisted SSE transcripts apply the same redactor
-  to event data at capture time; the live stream view keeps raw event data
-  (accepted display boundary). The adapter refuses to send or copy a
-  request whose substitution-provenance recording overflowed while any
-  secret candidate is in play (incomplete taint closure ⇒ fail closed), and
-  the store refuses to record a secret-capture exchange once the bounded
-  rejected-secret provenance quota (64/run) is exhausted. Codelens previews
-  are a remaining #47 slice.
+  JSON-aware: for a JSON body, string leaves are masked textually while a
+  non-string scalar is replaced wholesale when its serialized form contains
+  a secret substring. The recorded copy therefore stays parseable, cannot
+  re-expose a larger numeric/boolean/null value after secret rotation, and
+  keeps unrelated fields referenceable. JSON object keys are scrubbed too;
+  output uses inert own-data properties (including `__proto__`), and keys
+  that mask identically collapse by a deterministic raw-key ordering
+  (lexicographically-smallest source key wins) rather than JavaScript's
+  integer-key enumeration order. Every candidate (structured
+  re-serialization, re-redacted serialization, textual masking) must
+  re-parse AND contain no active secret in its RAW BYTES **or its DECODED
+  content** (Unicode-escaped secrets decode before any reference reads
+  them); when none qualifies — a secret lives in the JSON STRUCTURE
+  itself, e.g. `":"` between a key and its value, or an escaped secret
+  only surfaces after decoding — the scrubber refuses the recording and
+  the store keeps an EMPTY
+  body: later `{{name.request.body.$…}}` references then fail closed with
+  the actionable not-valid-JSON diagnostic instead of ever serving invalid
+  or secret-bearing JSON (review r11/r12 fail-closed contract). Persisted SSE
+  transcripts
+  apply the same redactor to every string field of each event (`type`,
+  `data`, `lastEventId`) at capture time, and a numeric `retry:` whose
+  serialized form contains a known secret substring is dropped; the live stream view
+  keeps raw event data (accepted display boundary). The adapter refuses to
+  send or copy a request while any secret candidate is in play AND either
+  the substitution-provenance recording overflowed or the derived-variant
+  closure was truncated (incomplete taint closure ⇒ fail closed). The store
+  refuses to record a named exchange whose secret capture directives would
+  cross the bounded rejected-secret provenance quota (64/run), reserving one
+  slot per directive up front. The placeholder candidate bound
+  (MAX_CHAIN_REFS_PER_PASS=100) is shared across URL, headers, and body
+  within one resolution pass, so junk candidates cannot reset it by
+  spreading across fields. Codelens previews are a remaining #47 slice.
 - At most `MAX_CAPTURES_PER_REQUEST` (32) capture directives are collected
   per request; beyond that the parser keeps the first 32 and emits a parse
   diagnostic instead of silently truncating (hostile-import bound).

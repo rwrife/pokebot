@@ -601,3 +601,42 @@ describe('review r7 bounds (LOGIC2 + S6)', () => {
     expect(results[0].diagnostic).toContain('max 128');
   });
 });
+
+describe('cross-field scan budget (review r9 LOGIC2)', () => {
+  it('empty candidates in one header consume the budget for the whole request pass', () => {
+    // The advertised bound is PER REQUEST PASS (resolveChainRequest), so
+    // spreading junk candidates across fields cannot reset it (r9).
+    const s = createChainStore();
+    s.recordResponse('scan', { status: 207, headers: {}, body: '{}' });
+    const r = resolveChainRequest(
+      {
+        url: 'https://x.test/',
+        headers: [
+          { name: 'X-Junk', value: '{{}}'.repeat(MAX_CHAIN_REFS_PER_PASS) },
+          { name: 'X-Ref', value: '{{scan.response.status}}' },
+        ],
+        body: '',
+      },
+      s,
+    );
+    expect(r.headers[1].value).toBe('{{scan.response.status}}'); // left literal
+    expect(r.diagnostics.some((d) => /too many/i.test(d.message))).toBe(true);
+  });
+
+  it('a normal request uses one shared budget without false positives (control)', () => {
+    const s = createChainStore();
+    s.recordResponse('scan', { status: 207, headers: {}, body: '{}' });
+    const r = resolveChainRequest(
+      {
+        url: 'https://x.test/?a={{scan.response.status}}',
+        headers: [{ name: 'X-Ref', value: '{{scan.response.status}}' }],
+        body: '{{scan.response.status}}',
+      },
+      s,
+    );
+    expect(r.url).toBe('https://x.test/?a=207');
+    expect(r.headers[0].value).toBe('207');
+    expect(r.body).toBe('207');
+    expect(r.diagnostics).toEqual([]);
+  });
+});

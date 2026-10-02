@@ -242,22 +242,26 @@ export function activate(context: vscode.ExtensionContext): void {
           );
           return;
         }
-        // Fail closed on provenance overflow with secrets in play, mirroring
-        // runRequest (issue #47 review r7 SEC1) — the clipboard must not
-        // receive an export built from an incomplete taint closure.
-        if (substituted.injectedOverflow && (chained.resolvedSecrets.length > 0 || secretValues.length > 0)) {
-          vscode.window.showErrorMessage(
-            'Reqit: too many substitutions to guarantee secret redaction — copy blocked. Reduce templated references (over 1000 recorded substitutions) and try again.',
-          );
-          return;
-        }
         // Same taint closure as runRequest (issue #47 review S5): env-injected
         // expansions of secret text — including complete post-substitution
         // derived variants — join the clipboard redaction set.
-        const copySecrets = deriveSecretVariants(
+        const copyClosure = deriveSecretVariants(
           [...chained.resolvedSecrets, ...secretValues],
           substituted.injected,
         );
+        const copySecrets = copyClosure.variants;
+        // Fail closed on provenance overflow OR a truncated derivation
+        // closure while secrets are in play, mirroring runRequest (issue #47
+        // review r7 SEC1 + r9): either state means the redaction set may be
+        // missing the exact derived value that reached the wire.
+        const hasSecretCandidates =
+          chained.resolvedSecrets.length > 0 || secretValues.length > 0;
+        if (hasSecretCandidates && (substituted.injectedOverflow || copyClosure.truncated)) {
+          vscode.window.showErrorMessage(
+            'Reqit: too many substitutions to guarantee secret redaction — copy blocked. Reduce templated references (over 1000 recorded substitutions or over-bound secret template expansions) and try again.',
+          );
+          return;
+        }
         let opts;
         try {
           opts = toUndiciRequest({
@@ -509,19 +513,6 @@ async function runRequest(
     );
     return;
   }
-  // Fail closed on provenance overflow while ANY secret is in play (issue #47
-  // review r7 SEC1): once recording stopped at MAX_INJECTED_RECORDS, a later
-  // — unrecorded — substitution could be the expansion of a secret template,
-  // so the taint closure would be incomplete and derived surfaces could ship
-  // the secret unredacted. Block instead of sending an unreconcilable
-  // request. With zero secret candidates the closure provably contributes
-  // nothing and legitimate huge templated bodies keep working.
-  if (substituted.injectedOverflow && (chained.resolvedSecrets.length > 0 || secretValues.length > 0)) {
-    vscode.window.showErrorMessage(
-      'Reqit: too many substitutions to guarantee secret redaction — request blocked. Reduce templated references (over 1000 recorded substitutions) and try again.',
-    );
-    return;
-  }
   const requestForUndici: ParsedRequest = {
     ...req,
     url: substituted.url,
@@ -546,10 +537,27 @@ async function runRequest(
   // including the collapse case where an empty expansion leaves neither the
   // template nor the component as a substring) and chained expansions, with
   // bounded growth for hostile self-referencing templates.
-  const renderSecrets = deriveSecretVariants(
+  const renderClosure = deriveSecretVariants(
     [...chained.resolvedSecrets, ...secretValues],
     substituted.injected,
   );
+  const renderSecrets = renderClosure.variants;
+  // Fail closed on provenance overflow OR a truncated derivation closure
+  // while ANY secret is in play (issue #47 review r7 SEC1 + r9): once
+  // recording stopped at MAX_INJECTED_RECORDS, or the bounded fixpoint cut
+  // off a template expansion, the redaction set may be missing the exact
+  // derived value that reached the wire. Block instead of sending an
+  // unreconcilable request. With zero secret candidates the closure provably
+  // contributes nothing and legitimate huge templated bodies keep working.
+  if (
+    (chained.resolvedSecrets.length > 0 || secretValues.length > 0) &&
+    (substituted.injectedOverflow || renderClosure.truncated)
+  ) {
+    vscode.window.showErrorMessage(
+      'Reqit: too many substitutions to guarantee secret redaction — request blocked. Reduce templated references (over 1000 recorded substitutions or over-bound secret template expansions) and try again.',
+    );
+    return;
+  }
   // One helper for every user-facing text derived from this request's
   // substitution stage: transport/validator error messages and stacks all
   // route through here (issue #47 review C — a raw exception can embed the
@@ -610,7 +618,15 @@ async function runRequest(
     // the JSON-aware scrubber so a numeric/boolean secret cannot break
     // `{{name.request.body.$…}}` references to UNRELATED fields for the
     // rest of the run (issue #47 review r7 LOGIC3).
-    const recordedBody = scrubRecordedBody(opts.body ?? '', renderSecrets);
+    // Refusal contract (issue #47 review r11): when no scrub candidate can
+    // be BOTH valid JSON AND secret-free (a secret lives in the JSON
+    // structure itself), the scrubber returns `null` and the store records
+    // an EMPTY body — the truthful "no recordable body" state. Later
+    // `{{name.request.body.$…}}` references then fail closed with the
+    // actionable "not valid JSON" diagnostic instead of either leaking the
+    // secret or silently serving corrupt JSON. The wire request is
+    // unaffected; only referenceability is refused.
+    const recordedBody = scrubRecordedBody(opts.body ?? '', renderSecrets) ?? '';
     if (isSseResponse(res.headers)) {
       // SSE streams have no single response body to capture from; record
       // the exchange with an empty body so at least `{{name.response.status}}`
@@ -827,11 +843,28 @@ async function streamSseResponse(
       // record fields can enter the transcript.
       // The transcript is a PERSISTED derived surface (saved .jsonl outlives
       // the session), so it gets the canonical redaction pass the documented
-      // boundary requires (issue #47 review r7 SEC3). The LIVE view above
-      // keeps the raw event data — the explicitly accepted display boundary.
+      // boundary requires (issue #47 review r7 SEC3 + r9: `type` and
+      // `lastEventId` are attacker-controlled strings too). The LIVE view
+      // above keeps the raw event data — the accepted display boundary.
       transcriptRecords.push(
         pickSseTranscriptRecord({
-          event: { ...event, data: redactSecretText(event.data, renderSecrets) },
+          event: {
+            // Avoid copying retry from the raw event by default. It is
+            // conditionally reintroduced below only when its decimal text
+            // carries no secret substring.
+            type: redactSecretText(event.type, renderSecrets),
+            data: redactSecretText(event.data, renderSecrets),
+            ...(event.lastEventId !== undefined
+              ? { lastEventId: redactSecretText(event.lastEventId, renderSecrets) }
+              : {}),
+            // Numeric retry field: mask by OMISSION whenever its serialized
+            // form CONTAINS a known secret (r10 — numeric values cannot carry
+            // a string redaction marker without breaking the JSONL schema).
+            ...(typeof event.retry === 'number' &&
+            redactSecretText(String(event.retry), renderSecrets) === String(event.retry)
+              ? { retry: event.retry }
+              : {}),
+          },
           index: meta.index,
           timestampMs: eventTimestampMs,
           sentRequest: opts,

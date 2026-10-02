@@ -147,7 +147,11 @@ export interface ChainRecordResult {
  * - `captures` are raw `# @capture` directive sources (from the parser).
  * - `sentBody` is the body recorded for `{{name.request.body.$.path}}`
  *   references. The core stores it verbatim; the VS Code adapter passes the
- *   secret-scrubbed copy of the wire body (issue #47 review F1-R3/r6).
+ *   secret-scrubbed copy of the wire body (issue #47 review F1-R3/r6). When
+ *   the scrubber refuses (no candidate is both valid JSON and secret-free,
+ *   review r11), the adapter records the empty string — the truthful
+ *   "no recordable body" state, which makes later body references fail
+ *   closed with the not-valid-JSON diagnostic.
  * - A `received: false` exchange mutates nothing.
  */
 export function recordChainExchange(
@@ -190,13 +194,20 @@ export function recordChainExchange(
   // is then not referenceable at all) instead of silently dropping the
   // hint. Unnamed exchanges record no response, so they cannot leak this
   // way and are unaffected, as are exchanges without secret directives.
+  const secretDirectiveCount = captureSources.filter((src) => {
+    const parsed = parseCaptureDirective(src);
+    return !('error' in parsed) && parsed.secret === true;
+  }).length;
+  // Conservative headroom check (issue #47 review r9 SEC2): every secret
+  // directive MIGHT be rejected and need a hint, so the exchange is refused
+  // unless the quota has room for ALL of them. Dedup inside the store may
+  // have used less than the full reserve — refusing anyway is the
+  // fail-closed direction and keeps a recorded named exchange's provenance
+  // promise whole.
   if (
     name !== undefined &&
-    store.secretProvenance().length >= MAX_SECRET_PROVENANCE &&
-    captureSources.some((src) => {
-      const parsed = parseCaptureDirective(src);
-      return !('error' in parsed) && parsed.secret === true;
-    })
+    secretDirectiveCount > 0 &&
+    store.secretProvenance().length + secretDirectiveCount > MAX_SECRET_PROVENANCE
   ) {
     diagnostics.push(
       `request not recorded: secret-capture provenance quota (${MAX_SECRET_PROVENANCE}) exhausted for this run — the response would not be safely redactable (secret-provenance limit)`,

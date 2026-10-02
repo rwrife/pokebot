@@ -558,6 +558,10 @@ interface ResolutionContext {
   store: ChainStore;
   jsonCache: Map<string, { ok: true; doc: unknown } | { ok: false }>;
   chainRefs: number;
+  /** Placeholder-CANDIDATE budget shared across every field of one request
+   * pass (issue #47 review r9 LOGIC2): spreading junk `{{}}` candidates
+   * across URL/headers/body cannot reset the bound field by field. */
+  scanBudget: number;
   boundDiagPosted: boolean;
   resolvedCaptures: ResolvedCapture[];
 }
@@ -565,6 +569,7 @@ interface ResolutionContext {
 function createResolutionContext(store: ChainStore): ResolutionContext {
   return {
     store,
+    scanBudget: MAX_CHAIN_REFS_PER_PASS,
     jsonCache: new Map(),
     chainRefs: 0,
     boundDiagPosted: false,
@@ -736,7 +741,7 @@ function nextDoubleBrace(source: string, from: number): number {
 function findPlaceholders(
   source: string,
   maxCount: number,
-): { list: Placeholder[]; truncated: boolean; last: Placeholder | null } {
+): { list: Placeholder[]; truncated: boolean; last: Placeholder | null; opened: number } {
   const out: Placeholder[] = [];
   let last: Placeholder | null = null;
   let opened = 0;
@@ -753,7 +758,7 @@ function findPlaceholders(
     // bound — the caller emits the remaining source verbatim, matching the
     // "left literal" overflow semantics of MAX_CHAIN_REFS_PER_PASS.
     if (opened >= maxCount) {
-      return { list: out, truncated: true, last };
+      return { list: out, truncated: true, last, opened };
     }
     opened += 1;
     // Candidate opened at i. Scan for the first top-level `}}`.
@@ -820,7 +825,7 @@ function findPlaceholders(
     }
     i = closed + 2;
   }
-  return { list: out, truncated: false, last };
+  return { list: out, truncated: false, last, opened };
 }
 
 /**
@@ -844,7 +849,10 @@ function resolveChainTextWith(ctx: ResolutionContext, source: string): ChainSubs
   // so a hostile body's work/memory is O(bound) rather than O(body).
   // Remaining text after the bound is emitted verbatim, matching the
   // "left literal" overflow semantics of MAX_CHAIN_REFS_PER_PASS.
-  const scan = findPlaceholders(source, MAX_CHAIN_REFS_PER_PASS);
+  // Spend from the SHARED per-pass candidate budget (r9 LOGIC2).
+  const budget = Math.max(0, ctx.scanBudget);
+  const scan = findPlaceholders(source, budget);
+  ctx.scanBudget = budget - scan.opened;
   const placeholders = scan.list;
   if (placeholders.length === 0) {
     // Even with nothing listable, the candidate bound can already be hit

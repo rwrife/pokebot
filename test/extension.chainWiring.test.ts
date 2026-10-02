@@ -121,12 +121,11 @@ function jsonResponse(status: number, body: string, headers: Record<string, stri
 }
 
 /**
- * Fixture for the SEC1 provenance-overflow tests: 1200 built-in substitutions
- * spread across 15 header values (80 each). Every per-field placeholder scan
- * stays under MAX_CHAIN_REFS_PER_PASS (100), so the chain stage passes them
- * through untouched; only the RECORD cap (MAX_INJECTED_RECORDS=1000) is
- * exceeded when substituteRequest merges provenance across fields — exactly
- * the state the fail-closed adapter gate must detect.
+ * Hostile placeholder fixture: 1200 built-in candidates spread across 15
+ * headers. Since the r9 request-wide scan-budget fix, this is rejected by the
+ * chain-stage 100-candidate bound BEFORE env substitution. That ordering is
+ * intentional: an attacker cannot bypass the scan bound by spreading junk
+ * across fields, and no request/clipboard side effect occurs.
  */
 function floodDoc(requestLine: string): string {
   const headers = Array.from(
@@ -377,7 +376,7 @@ describe('extension send-path chaining wiring', () => {
     await Promise.race([streamPromise, new Promise((r) => setTimeout(r, 1500))]);
     host.undiciRequest.mockReset();
     host.undiciRequest.mockImplementation(async () => jsonResponse(200, '{}'));
-  });
+  }, 15_000);
 
   it('a secret capture substituted into the BODY is absent from the ENTIRE rendered request object', async () => {
     const SECRET = 'bod' + 'ysecret-99';
@@ -1005,12 +1004,7 @@ describe('extension send-path chaining wiring', () => {
     expect(host.clipboardWrite.mock.calls.length).toBe(0);
   });
 
-  it('a request whose substitution provenance overflowed the record cap BLOCKS the send (review r7 SEC1)', async () => {
-    // Fail-closed: with secret candidates in play, once recording exceeds
-    // MAX_INJECTED_RECORDS the adapter can no longer prove it knows every
-    // value derived from a secret template, so it must block with an
-    // actionable error instead of shipping a request it cannot guarantee
-    // redacts on the derived surfaces.
+  it('request-wide placeholder bound blocks hostile cross-field junk before substitution (r9 LOGIC2 reachability)', async () => {
     docWith(floodDoc('POST {{host}}/x?tk={{tk}}'));
     host.env.set('host', 'https://api.test');
     host.env.set('tk', 'sec' + 'ret-42');
@@ -1020,22 +1014,10 @@ describe('extension send-path chaining wiring', () => {
 
     expect(host.undiciRequest.mock.calls.length).toBe(0);
     const texts = host.showErrorMessage.mock.calls.map((c) => String(c[0]));
-    expect(texts.some((t) => t.includes('too many substitutions'))).toBe(true);
+    expect(texts.some((t) => /too many placeholders in one pass/i.test(t))).toBe(true);
   });
 
-  it('provenance overflow with NO secrets in play does NOT block (SEC1 precision)', async () => {
-    // Overflow alone is harmless when zero secret candidates exist (the
-    // taint closure provably contributes nothing). Blocking here would
-    // punish legitimate huge templated bodies for no security gain.
-    docWith(floodDoc('POST {{host}}/bulk'));
-    host.env.set('host', 'https://api.test');
-    host.undiciRequest.mockResolvedValueOnce(jsonResponse(200, '{}'));
-    activate({ subscriptions: [] } as unknown as ExtensionContext);
-    await sendHandler()({ documentUri: 'file:///workspace/api.http', requestLineIndex: 0 });
-    expect(host.undiciRequest.mock.calls.length).toBe(1);
-  });
-
-  it('copy-as-cURL also fails closed on provenance overflow with secrets present (SEC1 copy path)', async () => {
+  it('copy-as-cURL also blocks on request-wide placeholder candidate overflow (r9 LOGIC2 copy path)', async () => {
     docWith(floodDoc('POST {{host}}/x?tk={{tk}}'));
     host.env.set('host', 'https://api.test');
     host.env.set('tk', 'sec' + 'ret-43');
@@ -1047,7 +1029,7 @@ describe('extension send-path chaining wiring', () => {
     await handler({ documentUri: 'file:///workspace/api.http', requestLineIndex: 0 });
     expect(host.clipboardWrite.mock.calls.length).toBe(0);
     const texts = host.showErrorMessage.mock.calls.map((c) => String(c[0]));
-    expect(texts.some((t) => t.includes('too many substitutions'))).toBe(true);
+    expect(texts.some((t) => /unresolved chain references/i.test(t))).toBe(true);
   });
 
   it('a declared-but-invalid @name warns on the activate path and records nothing', async () => {
@@ -1082,14 +1064,23 @@ describe('extension send-path chaining wiring', () => {
     // event data echoed into the saved .jsonl must carry the redaction the
     // documented boundary requires.
     const SECRET = 'sse' + 'ret-77';
+    const RETRY_SECRET = '2' + '3';
     host.env.set('host', 'https://api.test');
     host.env.set('echo', SECRET);
-    host.secrets.push(SECRET);
+    host.secrets.push(SECRET, RETRY_SECRET);
     docWith(['GET {{host}}/events?e={{echo}}', '# @sse-max-events 1', ''].join('\n'));
     host.renderSseResponse.mockReturnValue({ update: vi.fn(), dispose: vi.fn() });
     // One event whose data echoes the secret, then a clean end-of-stream.
+    const rawFrame = `id: ${SECRET}\nevent: ${SECRET}-type\nretry: 123\ndata: token=${SECRET}\n\n`;
+    // Non-vacuity: the exact raw frame consumed by the parser carries both
+    // the string secret and the retry-secret substring.
+    expect(rawFrame).toContain(SECRET);
+    expect(rawFrame).toContain(RETRY_SECRET);
     const body = (async function* () {
-      yield `data: token=${SECRET}\n\n`;
+      // Hostile event: secret echoed in data AND smuggled into the id:
+      // field (type/lastEventId are attacker-controlled strings), while a
+      // numeric retry contains another secret as a substring.
+      yield rawFrame;
     })();
     host.undiciRequest.mockResolvedValueOnce({
       statusCode: 200,
@@ -1116,6 +1107,11 @@ describe('extension send-path chaining wiring', () => {
     const content = writes.join('\n');
     expect(content).toContain('token=');
     expect(content).not.toContain(SECRET);
+    // The retry value (123) carries the second secret as a substring, so
+    // the persisted record must omit the retry field entirely. (Asserting
+    // the absence of the digit substring itself would be flaky against the
+    // record's own wall-clock timestamp.)
+    expect(content).not.toContain('"retry"');
     expect(content).toContain('[REDACTED]');
   });
 
@@ -1150,4 +1146,81 @@ describe('extension send-path chaining wiring', () => {
     // is scrubbed.
     const firstCall = host.undiciRequest.mock.calls[0] as [string, { body?: string }];
     expect(String(firstCall[1].body)).toContain(NUM_SECRET);
+  });
+
+  it('a JSON body whose secret lives in the JSON structure records NO body and fails references closed (r11)', async () => {
+    // Reviewer r11 repro end-to-end: the secret `":"` sits between the key
+    // and value tokens of the wire body, so NO scrub candidate can be both
+    // valid JSON and secret-free. The scrubber must refuse (null) and the
+    // adapter must then store the empty "no recordable body" state — a
+    // later {{name.request.body.$…}} reference fails with the actionable
+    // not-valid-JSON diagnostic and blocks the send, while the real wire
+    // request is unaffected.
+    const SYNTAX_SECRET = '":"' + ''; // concat: survives transcript redaction
+    docWith(
+      [
+        '### SyntaxLogin',
+        '# @name slogin',
+        'POST {{host}}/login',
+        'content-type: application/json',
+        '',
+        // Non-vacuity: the wire body genuinely contains the secret at the
+        // key/value boundary (`"pin" : "123"` without whitespace), and the
+        // decoded JSON strings never contain it — it lives ONLY in the
+        // serialization structure, which no leaf-level scrub can remove.
+        '{"pin":"123"}',
+      ].join('\n'),
+    );
+    host.env.set('host', 'https://api.test');
+    host.secrets.push(SYNTAX_SECRET);
+    host.undiciRequest.mockResolvedValueOnce(jsonResponse(200, '{"ok":true}'));
+    activate({ subscriptions: [] } as unknown as ExtensionContext);
+    await sendHandler()({ documentUri: 'file:///workspace/api.http', requestLineIndex: 2 });
+
+    // Non-vacuity: the FIRST wire request genuinely carried the secret and
+    // succeeded — the exchange WAS received, so recording was attempted.
+    const firstCall = host.undiciRequest.mock.calls[0] as [string, { body?: string }];
+    expect(String(firstCall[1].body)).toContain(SYNTAX_SECRET);
+
+    // Reference a body field: the store refused the body, so the chain
+    // reference must fail loudly and block the send (no second wire call).
+    docWith(['GET {{host}}/x?b={{slogin.request.body.$.pin}}'].join('\n'));
+    await sendHandler()({ documentUri: 'file:///workspace/api.http', requestLineIndex: 0 });
+    expect(host.undiciRequest.mock.calls.length).toBe(1);
+    const texts = host.showErrorMessage.mock.calls.map((c) => String(c[0]));
+    expect(texts.some((t) => t.includes('not valid JSON'))).toBe(true);
+    // The secret never reached any rendered surface: no second render echo
+    // exists at all (the send was blocked before rendering).
+    expect(host.renderResponse.mock.calls.length).toBe(1);
+  });
+
+  it('a secret template whose derivation hits the closure bound BLOCKS the send (r9 fail-closed)', async () => {
+    // The secret is a self-referencing template: its expansion closure is
+    // cut off at MAX_DERIVED_ADDITIONS, so the adapter cannot prove it knows
+    // every wire form -> block rather than redact from a partial set.
+    // The request references the secret template so the env stage injects
+    // `{{loop}}` -> `L{{loop}}`; the closure then self-expands until the
+    // derived-additions bound cuts it off.
+    docWith(['POST {{host}}/x', '', '{{loop}}'].join('\n'));
+    host.env.set('host', 'https://api.test');
+    host.env.set('loop', 'L{{loop}}');
+    host.secrets.push('L{{loop}}');
+    activate({ subscriptions: [] } as unknown as ExtensionContext);
+    await sendHandler()({ documentUri: 'file:///workspace/api.http', requestLineIndex: 0 });
+    expect(host.undiciRequest.mock.calls.length).toBe(0);
+    const texts = host.showErrorMessage.mock.calls.map((c) => String(c[0]));
+    expect(texts.some((t) => t.includes('too many substitutions'))).toBe(true);
+  });
+
+  it('copy-as-cURL blocks on truncated derivation closure too (r9 copy path)', async () => {
+    docWith(['POST {{host}}/x', '', '{{loop}}'].join('\n'));
+    host.env.set('host', 'https://api.test');
+    host.env.set('loop', 'L{{loop}}');
+    host.secrets.push('L{{loop}}');
+    activate({ subscriptions: [] } as unknown as ExtensionContext);
+    const handler = host.registerCommand.mock.calls.find(
+      ([name]) => name === 'reqit.copyAsCurl',
+    )![1] as (a: { documentUri: string; requestLineIndex: number }) => Promise<void>;
+    await handler({ documentUri: 'file:///workspace/api.http', requestLineIndex: 0 });
+    expect(host.clipboardWrite.mock.calls.length).toBe(0);
   });

@@ -598,3 +598,33 @@ describe('recordChainExchange', () => {
     }
   });
 });
+
+  it('an exchange whose secret directives WOULD CROSS the quota is refused (review r9 SEC2)', () => {
+    // Batch-crossing canary: quota at 63, one exchange with TWO rejected
+    // secret captures. Pre-fix, the guard only fired at a FULL quota, the
+    // exchange recorded, and the 2nd hint was silently dropped — leaving a
+    // recorded response carrying a secret the sweep no longer knows.
+    const store = createChainStore();
+    recordChainExchange(store, 'seed', ['tok: string secret = $.t'], '', exchange({ body: '{"t":"seed0"}' }));
+    for (let i = 1; i <= 63; i++) {
+      const r = recordChainExchange(store, `c${i}`, ['tok: string secret = $.t'], '', exchange({ body: `{"t":"secretval${i}"}` }));
+      expect(r.applied).toHaveLength(0); // name 'tok' owned by seed -> rejected -> hint
+    }
+    // 63 rejected secret hints; quota has exactly ONE slot left (64).
+    expect(store.secretProvenance().length).toBe(63);
+    const crossing = recordChainExchange(
+      store,
+      'late',
+      ['a: string secret = $.a', 'b: string secret = $.b'],
+      '',
+      exchange({ body: '{"a":"quota64","b":"quota65-canary"}' }),
+    );
+    expect(crossing.applied).toHaveLength(0);
+    expect(crossing.diagnostics.some((d) => d.includes('secret-provenance'))).toBe(true);
+    // The response must NOT be referenceable at all.
+    const out = prepareChainSend(
+      { url: 'https://api.test/x?v={{late.response.body.$.b}}', headers: [], body: '' },
+      store,
+    );
+    expect(out.url).not.toContain('quota65-canary');
+  });
