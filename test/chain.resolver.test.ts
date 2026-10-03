@@ -7,6 +7,8 @@ import {
   resolveChainRequest,
   applyCapture,
   validateRequestNames,
+  isValidChainName,
+  MAX_CHAIN_REFS_PER_PASS,
 } from '../src/core/chain/resolver.js';
 
 describe('parseChainReference', () => {
@@ -101,6 +103,30 @@ describe('validateRequestNames', () => {
     const diags = validateRequestNames(['login', 'login', '1bad', 'ok']);
     expect(diags.some((d) => d.includes('duplicate'))).toBe(true);
     expect(diags.some((d) => d.includes('1bad'))).toBe(true);
+  });
+
+  it('caps identifier length so hostile names cannot flood diagnostics (issue #47 review S6)', () => {
+    const long = `x${'y'.repeat(200)}`;
+    expect(isValidChainName(long)).toBe(false);
+    expect(isValidChainName(`x${'y'.repeat(127)}`)).toBe(true);
+    const diags = validateRequestNames([long]);
+    expect(diags).toHaveLength(1);
+    // The diagnostic echoes the offending name — it must be clipped, not a
+    // verbatim 200-char embed (bounded toast requirement).
+    expect(diags[0]!.length).toBeLessThan(300);
+    expect(diags[0]).toContain('…');
+  });
+});
+
+describe('parseCaptureDirective name bound (review S6)', () => {
+  it('rejects capture names over the length cap with a bounded diagnostic', () => {
+    const long = `c${'z'.repeat(200)}`;
+    const res = parseCaptureDirective(`${long} = $.a`);
+    expect('error' in res).toBe(true);
+    if ('error' in res) {
+      expect(res.error.length).toBeLessThan(300);
+      expect(res.error).toContain('…');
+    }
   });
 });
 
@@ -328,8 +354,8 @@ describe('resolveChainText / resolveChainRequest', () => {
   it('deep-copies object capture values on record and retrieval', () => {
     const s = store();
     const obj = { nested: { tok: 'original' } };
-    const errs = s.recordCaptures([{ name: 'objcap', value: obj, secret: false }]);
-    expect(errs).toEqual([]);
+    const diags = s.recordCaptures([{ name: 'objcap', value: obj, secret: false }]);
+    expect(diags.filter((r) => !r.stored)).toEqual([]);
     obj.nested.tok = 'tampered-source';
     const got = s.getCapture('objcap')!;
     expect((got.value as typeof obj).nested.tok).toBe('original');
@@ -400,11 +426,11 @@ describe('resolveChainText / resolveChainRequest', () => {
 
   it('stores captures per run with duplicate detection and secret flags', () => {
     const s = store();
-    const errs = s.recordCaptures([
+    const results = s.recordCaptures([
       { name: 'token', value: 'tok', secret: true },
       { name: 'count', value: 7, secret: false },
     ]);
-    expect(errs).toEqual([]);
+    expect(results.every((r) => r.stored)).toBe(true);
     expect(s.getCapture('token')).toEqual({ value: 'tok', secret: true });
     expect(s.getCapture('count')).toEqual({ value: 7, secret: false });
     expect(s.getCapture('absent')).toBeUndefined();
@@ -413,12 +439,13 @@ describe('resolveChainText / resolveChainRequest', () => {
     // duplicate names are rejected per-run (must be caught before wiring)
     const dup = s.recordCaptures([{ name: 'token', value: 'tok2', secret: true }]);
     expect(dup).toHaveLength(1);
-    expect(dup[0]).toContain('duplicate capture');
+    expect(dup[0]!.stored).toBe(false);
+    expect(dup[0]!.diagnostic).toContain('duplicate capture');
     expect(s.getCapture('token')).toEqual({ value: 'tok', secret: true }); // first wins
 
     // invalid names rejected
     const bad = s.recordCaptures([{ name: '1bad', value: 'x', secret: false }]);
-    expect(bad.some((d) => d.includes('1bad'))).toBe(true);
+    expect(bad.some((r) => !r.stored && r.diagnostic!.includes('1bad'))).toBe(true);
 
     // clear() wipes captures too
     s.clear();
@@ -486,5 +513,130 @@ describe('applyCapture', () => {
   it('reports path misses and parse errors as errors', () => {
     expect('error' in applyCapture('x = $.missing.path', response)).toBe(true);
     expect('error' in applyCapture('bad name = $.x', response)).toBe(true);
+  });
+});
+
+describe('review r7 bounds (LOGIC2 + S6)', () => {
+  const store = () => {
+    const s = createChainStore();
+    s.recordResponse('login', { status: 201, headers: {}, body: '{}' });
+    return s;
+  };
+  it('EMPTY and ABANDONED placeholder candidates consume the scan bound (LOGIC2)', () => {
+    // Round-7 LOGIC2: the bound counted only non-empty parsed placeholders,
+    // so 100 `{{}}` candidates followed by a chain ref still resolved with
+    // no overflow diagnostic — a trivially bypassed bound. Every `{{`
+    // candidate opened must count toward the scan limit.
+    const s = store();
+    const hostile = '{{}}'.repeat(MAX_CHAIN_REFS_PER_PASS) + '{{login.response.status}}';
+    const r = resolveChainText(hostile, s);
+    expect(r.text).toContain('{{login.response.status}}'); // left literal
+    expect(r.text).not.toContain('201');
+    expect(r.diagnostics.some((d) => /too many/i.test(d.message))).toBe(true);
+  });
+
+  it('abandoned malformed candidates consume the scan bound too (LOGIC2)', () => {
+    const s = store();
+    // `{{a}` candidates (lone `}`) are abandoned regions; they must still
+    // burn scan-bound budget.
+    // Each repetition opens AND abandons one candidate (the `}}` at the
+    // repetition end is the resume terminator), so 100 candidates really do
+    // open before the final chain reference.
+    const hostile = '{{a}x}}'.repeat(MAX_CHAIN_REFS_PER_PASS) + '{{login.response.status}}';
+    const r = resolveChainText(hostile, s);
+    expect(r.text).toContain('{{login.response.status}}');
+    expect(r.diagnostics.some((d) => /too many/i.test(d.message))).toBe(true);
+  });
+
+  it('scan-bound diagnostic survives an all-empty candidate list (LOGIC2 crash guard)', () => {
+    const s = store();
+    const r = resolveChainText('{{}}'.repeat(MAX_CHAIN_REFS_PER_PASS + 5), s);
+    // Must not throw and must report the bound.
+    expect(r.diagnostics.some((d) => /too many/i.test(d.message))).toBe(true);
+  });
+
+  it('over-length names are not chain refs and never reach diagnostics (S6)', () => {
+    const s = store();
+    const huge = 'x'.repeat(10_000);
+    const r = resolveChainText(`{{${huge}.response.status}}`, s);
+    // Not chain-intent (name can never be recorded) -> passed to env stage.
+    expect(r.diagnostics).toEqual([]);
+    expect(r.text).toBe(`{{${huge}.response.status}}`);
+  });
+
+  it('malformed chain diagnostics clip echoed text (S6)', () => {
+    const s = store();
+    const huge = 'z'.repeat(10_000);
+    const r = resolveChainText(`{{login.response.body.$.${huge}}}`, s);
+    expect(r.diagnostics.length).toBe(1);
+    const d = r.diagnostics[0];
+    expect(d.message.length).toBeLessThanOrEqual(320);
+    expect(d.reference.length).toBeLessThanOrEqual(320);
+    expect(d.variable.length).toBeLessThanOrEqual(320);
+    // Non-vacuity: the raw inner text WAS over the bound.
+    expect(huge.length).toBeGreaterThan(1000);
+  });
+
+  it('unresolved recorded-name error messages clip the name (S6)', () => {
+    const s = store();
+    const r = resolveChainText('{{ghost.response.body.$.a}}' + 'y'.repeat(0), s);
+    expect(r.diagnostics.length).toBe(1);
+    expect(r.diagnostics[0].message.length).toBeLessThanOrEqual(320);
+  });
+
+  it('parseChainReference rejects over-length request names (S6)', () => {
+    expect(parseChainReference(`${'x'.repeat(200)}.response.status`)).toBeNull();
+    expect(parseChainReference('login.response.status')).not.toBeNull();
+  });
+
+  it('recordCaptures enforces the name LENGTH cap, not just the shape (S6)', () => {
+    const s = createChainStore();
+    const results = s.recordCaptures(
+      [{ name: `a${'b'.repeat(200)}`, value: 'v', secret: false }],
+      { owner: 'login' },
+    );
+    expect(results[0].stored).toBe(false);
+    // Diagnostic must clip the hostile name.
+    expect(results[0].diagnostic!.length).toBeLessThanOrEqual(400);
+    expect(results[0].diagnostic).toContain('max 128');
+  });
+});
+
+describe('cross-field scan budget (review r9 LOGIC2)', () => {
+  it('empty candidates in one header consume the budget for the whole request pass', () => {
+    // The advertised bound is PER REQUEST PASS (resolveChainRequest), so
+    // spreading junk candidates across fields cannot reset it (r9).
+    const s = createChainStore();
+    s.recordResponse('scan', { status: 207, headers: {}, body: '{}' });
+    const r = resolveChainRequest(
+      {
+        url: 'https://x.test/',
+        headers: [
+          { name: 'X-Junk', value: '{{}}'.repeat(MAX_CHAIN_REFS_PER_PASS) },
+          { name: 'X-Ref', value: '{{scan.response.status}}' },
+        ],
+        body: '',
+      },
+      s,
+    );
+    expect(r.headers[1].value).toBe('{{scan.response.status}}'); // left literal
+    expect(r.diagnostics.some((d) => /too many/i.test(d.message))).toBe(true);
+  });
+
+  it('a normal request uses one shared budget without false positives (control)', () => {
+    const s = createChainStore();
+    s.recordResponse('scan', { status: 207, headers: {}, body: '{}' });
+    const r = resolveChainRequest(
+      {
+        url: 'https://x.test/?a={{scan.response.status}}',
+        headers: [{ name: 'X-Ref', value: '{{scan.response.status}}' }],
+        body: '{{scan.response.status}}',
+      },
+      s,
+    );
+    expect(r.url).toBe('https://x.test/?a=207');
+    expect(r.headers[0].value).toBe('207');
+    expect(r.body).toBe('207');
+    expect(r.diagnostics).toEqual([]);
   });
 });

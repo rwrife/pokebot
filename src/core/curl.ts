@@ -1,4 +1,5 @@
 import type { UndiciRequestOptions } from './request.js';
+import { secretRedactor } from './chain/redact.js';
 
 export interface CurlOptions {
   /** Secret values to replace with the placeholder before emitting curl text. */
@@ -15,13 +16,16 @@ export interface CurlOptions {
  *
  * Any `redact` strings (non-empty) found anywhere in the rendered command are
  * replaced with `redactPlaceholder` BEFORE quoting boundaries are computed,
- * so secrets cannot leak through partial-token reassembly.
+ * so secrets cannot leak through partial-token reassembly. Masking follows the
+ * canonical secret-redaction semantics (issue #47 review S2): each secret is
+ * masked in its raw AND JSON-escaped form, longest form first across the whole
+ * set — identical to `redactSecretText` apart from the placeholder token — so
+ * the clipboard cannot leak escaped secrets or longer-secret tails that the
+ * render echo already masks.
  */
 export function requestToCurl(opts: UndiciRequestOptions, options: CurlOptions = {}): string {
   const placeholder = options.redactPlaceholder ?? '***REDACTED***';
-  const redact = (options.redact ?? []).filter((s) => s.length > 0);
-  const apply = (s: string): string =>
-    redact.reduce((acc, secret) => acc.split(secret).join(placeholder), s);
+  const apply = secretRedactor(options.redact ?? [], placeholder);
 
   const parts: string[] = ['curl'];
   // Always be explicit about the method except for the implicit GET case

@@ -33,7 +33,38 @@ export interface SubstituteOptions {
 export interface SubstituteResult {
   text: string;
   diagnostics: SubstituteDiagnostic[];
+  /**
+   * Every successful substitution this call made, up to
+   * `MAX_INJECTED_RECORDS`: the literal reference text (e.g. `{{inner}}`
+   * or `{{$guid}}`) and the value injected in its place. Adapters use
+   * this for taint tracking (issue #47 review F1-R3): if a SECRET value
+   * contains one of these reference texts, the injected value (env or
+   * builtin — including random ones that cannot be recomputed) is what
+   * actually reached the wire and must join the redaction set. One entry
+   * PER OCCURRENCE (issue #47 review L3): repeated builtins like
+   * `{{$guid}}` produce distinct values per occurrence, so dedup would
+   * drop real wire values; the list is capped instead (issue #47 review
+   * L2) so a hostile flood cannot grow adapter work without bound — the
+   * substituted text itself is always complete.
+   */
+  injected: Array<{ reference: string; value: string }>;
+  /**
+   * True when recording stopped at `MAX_INJECTED_RECORDS` and at least one
+   * substitution was NOT recorded. Adapters that build a secret taint
+   * closure from `injected` MUST fail closed on this flag when any secret
+   * is in play (issue #47 review r7 SEC1): an omitted entry could be the
+   * expansion of a secret template, so the request is blocked rather than
+   * sent with an incomplete redaction set.
+   */
+  injectedOverflow: boolean;
 }
+
+/**
+ * Hard bound on recorded injections per call/result (issue #47 review L2).
+ * The bound exists for the PROVENANCE list, not the substitution: text is
+ * still substituted everywhere; recording stops once the cap is reached.
+ */
+export const MAX_INJECTED_RECORDS = 1000;
 
 const REF_RE = /\{\{\s*([^}]+?)\s*\}\}/g;
 
@@ -119,6 +150,15 @@ function evalBuiltin(
 /** Substitute `{{...}}` references inside `source` using `opts.resolve`. */
 export function substitute(source: string, opts: SubstituteOptions): SubstituteResult {
   const diagnostics: SubstituteDiagnostic[] = [];
+  const injected: Array<{ reference: string; value: string }> = [];
+  // Bounded recording (issue #47 review L2 + r7 SEC1): substitution always
+  // completes, but provenance recording stops at MAX_INJECTED_RECORDS and
+  // the overflow is FLAGGED so adapters fail closed on it.
+  let injectedOverflow = false;
+  const record = (reference: string, value: string): void => {
+    if (injected.length < MAX_INJECTED_RECORDS) injected.push({ reference, value });
+    else injectedOverflow = true;
+  };
   const rand = opts.random ?? defaultRandom;
   const now = opts.now ?? defaultNow;
 
@@ -126,7 +166,10 @@ export function substitute(source: string, opts: SubstituteOptions): SubstituteR
     const expr = raw.trim();
     if (expr.startsWith('$')) {
       const result = evalBuiltin(expr.slice(1), rand, now);
-      if ('value' in result) return result.value;
+      if ('value' in result) {
+        record(match, result.value);
+        return result.value;
+      }
       diagnostics.push({ reference: match, variable: expr, message: result.error });
       return match;
     }
@@ -139,10 +182,11 @@ export function substitute(source: string, opts: SubstituteOptions): SubstituteR
       });
       return match;
     }
+    record(match, resolved);
     return resolved;
   });
 
-  return { text, diagnostics };
+  return { text, diagnostics, injected, injectedOverflow };
 }
 
 /** Convenience: substitute over a request's URL, header values, and body in one pass. */
@@ -157,6 +201,18 @@ export interface RequestSubstitutionResult {
   headers: Array<{ name: string; value: string }>;
   body: string;
   diagnostics: SubstituteDiagnostic[];
+  /** Union of every successful substitution across url/headers/body,
+   * capped at `MAX_INJECTED_RECORDS` across the whole request (review L2). */
+  injected: Array<{ reference: string; value: string }>;
+  /**
+   * True when recording stopped at `MAX_INJECTED_RECORDS` and at least one
+   * substitution was NOT recorded. Adapters that build a secret taint
+   * closure from `injected` MUST fail closed on this flag when any secret
+   * is in play (issue #47 review r7 SEC1): an omitted entry could be the
+   * expansion of a secret template, so the request is blocked rather than
+   * sent with an incomplete redaction set.
+   */
+  injectedOverflow: boolean;
 }
 
 export function substituteRequest(
@@ -164,19 +220,37 @@ export function substituteRequest(
   opts: SubstituteOptions,
 ): RequestSubstitutionResult {
   const diagnostics: SubstituteDiagnostic[] = [];
+  const injected: Array<{ reference: string; value: string }> = [];
+  // Overflow propagates when any stage dropped a recording OR the union
+  // merge had to drop already-recorded per-stage entries (review r7 SEC1).
+  let injectedOverflow = false;
   const push = (d: SubstituteDiagnostic[]): void => {
     for (const x of d) diagnostics.push(x);
+  };
+  const merge = (items: Array<{ reference: string; value: string }>): void => {
+    for (const item of items) {
+      if (injected.length >= MAX_INJECTED_RECORDS) {
+        injectedOverflow = true;
+        break;
+      }
+      injected.push(item);
+    }
   };
 
   const url = substitute(req.url, opts);
   push(url.diagnostics);
+  merge(url.injected);
   const headers = req.headers.map((h) => {
     const v = substitute(h.value, opts);
     push(v.diagnostics);
+    merge(v.injected);
+    if (v.injectedOverflow) injectedOverflow = true;
     return { name: h.name, value: v.text };
   });
   const body = substitute(req.body, opts);
   push(body.diagnostics);
+  merge(body.injected);
+  if (url.injectedOverflow || body.injectedOverflow) injectedOverflow = true;
 
-  return { url: url.text, headers, body: body.text, diagnostics };
+  return { url: url.text, headers, body: body.text, diagnostics, injected, injectedOverflow };
 }

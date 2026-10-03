@@ -96,6 +96,25 @@ describe('substitute', () => {
     expect(r.text).toBe('{{$nope}}');
   });
 
+  it('caps recorded injections against a hostile substitution flood (issue #47 review L2)', () => {
+    // A hostile body with thousands of resolvable references must not make
+    // the adapter's taint-closure input grow without bound. Text is still
+    // fully substituted; only the recorded provenance list is capped — and
+    // the overflow is FLAGGED so adapters fail closed (review r7 SEC1).
+    const source = Array.from({ length: 2500 }, () => '{{v}}').join(',');
+    const r = substitute(source, { resolve: (n) => (n === 'v' ? 'x' : undefined) });
+    expect(r.text.split('x').length - 1).toBe(2500);
+    expect(r.injected.length).toBeLessThanOrEqual(1000);
+    expect(r.injected.length).toBeGreaterThan(0);
+    expect(r.injectedOverflow).toBe(true);
+  });
+
+  it('flags no overflow when recording stays under the cap (SEC1 control)', () => {
+    const source = Array.from({ length: 10 }, () => '{{v}}').join(',');
+    const r = substitute(source, { resolve: (n) => (n === 'v' ? 'x' : undefined) });
+    expect(r.injectedOverflow).toBe(false);
+  });
+
   it('makeUuidV4 sets version + variant bits', () => {
     const uuid = makeUuidV4(seqRandom(Array(16).fill(0.123)));
     expect(uuid[14]).toBe('4');

@@ -43,6 +43,7 @@ Reqit fixes that.
   - `clientCert` (mTLS) — PEM (`cert` + `key` + optional `ca`) or PFX with passphrase
   - `oauth2` — `clientCredentials` and `authorizationCode` w/ PKCE; tokens cached in `SecretStorage`
 - **Send Request codelens** — one-click execution backed by [`undici`](https://github.com/nodejs/undici); response opens in a side panel.
+- **Request chaining** — name a request with `# @name`, pull values out of its response with `# @capture name[: type [secret]] = $.path`, and reference them from later requests (`{{login.response.body.$.token}}`, `{{login.response.status}}`, `{{tok}}`). Chain references resolve before sending; unresolved ones block the send with an actionable error. Captures and recorded exchanges live in memory for the window session only — never persisted — and `secret` captures never appear in the rendered request echo. See [`docs/chain-grammar.md`](./docs/chain-grammar.md) and the scaffolded `.requests/chain.http` sample.
 - **Copy as curl** — POSIX-safe, secrets redacted by default. Opt in to `revealSecrets: true` when you really need it.
 - **Inline assertions** — `# @test status === 200`, `# @test json.id != null`, etc. (M6, runner UI shipping in follow-up).
 - **GraphQL** — mark a request with `# @graphql` or `X-Request-Kind: graphql` and write the query naturally; Reqit serializes `{ query, variables, operationName }` and pretty-prints `data` / `errors` separately. See `### GraphQL` below.
@@ -165,7 +166,7 @@ Define `.requests/.http-env.json`:
 
 ### Copy as curl
 
-Every request gets a **Copy as curl** codelens next to **Send Request**. The generated command is POSIX-safe (single-quoted) and any resolved secret values for the active environment are replaced with `***REDACTED***` before it hits the clipboard. Run the `reqit.copyAsCurl` command with `revealSecrets: true` if you explicitly need the unredacted version.
+Every request gets a **Copy as curl** codelens next to **Send Request**. The generated command is POSIX-safe (single-quoted) and resolved secrets — active-environment secret values and request-chaining secret captures, including their environment/builtin-expanded forms — are replaced with `***REDACTED***` before the command hits the clipboard, using the same canonical masker as the render echo (raw and JSON-escaped forms, longest-first). Run the `reqit.copyAsCurl` command with `revealSecrets: true` if you explicitly need the unredacted version.
 
 ### Test assertions (M6, in progress)
 

@@ -58,6 +58,15 @@ export interface ParsedRequest {
    * (see `src/core/assertions.ts`).
    */
   tests: string[];
+  /**
+   * Capture directive sources collected from `# @capture <name...>` /
+   * `// @capture <name...>` comment lines anywhere in the section. Order
+   * is source order; each entry is the raw text after `@capture` (parsed
+   * by `parseCaptureDirective` from `src/core/chain/`). Unlike other
+   * directives, captures accumulate instead of keeping only the last value
+   * — a request commonly declares several.
+   */
+  captures: string[];
   /** 0-indexed line in source where the request line starts. */
   requestLineIndex: number;
   /** 0-indexed line range [start, endExclusive) covering this request section. */
@@ -76,6 +85,15 @@ export interface ParseResult {
 }
 
 const METHOD_SET = new Set<string>(HTTP_METHODS);
+
+/**
+ * Upper bound on `# @capture` directives collected per request
+ * (issue #47 review B5: hostile imported files must not turn every send
+ * into unbounded per-directive capture work). Requests beyond the cap keep
+ * their first `MAX_CAPTURES_PER_REQUEST` directives and get an explicit
+ * parse diagnostic — never silent truncation.
+ */
+export const MAX_CAPTURES_PER_REQUEST = 32;
 
 function isCommentLine(line: string): boolean {
   const t = line.trimStart();
@@ -150,6 +168,8 @@ export function parseHttpFile(source: string): ParseResult {
     // Along the way, collect `@key value` directives from comment lines.
     const directives: Record<string, string> = {};
     const tests: string[] = [];
+    const captures: string[] = [];
+    let captureOverflow = 0;
     const collectDirective = (line: string): void => {
       const stripped = line.trimStart().replace(/^(#|\/\/)\s*/, '');
       const m = stripped.match(/^@([A-Za-z][A-Za-z0-9_-]*)(?:\s+(.+?))?\s*$/);
@@ -158,6 +178,15 @@ export function parseHttpFile(source: string): ParseResult {
       const value = (m[2] ?? '').trim();
       if (key === 'test') {
         if (value !== '') tests.push(value);
+        return;
+      }
+      if (key === 'capture') {
+        // Accumulates like `@test`; the last-value collapse for other
+        // directive keys would silently drop all but the final capture.
+        if (value !== '') {
+          if (captures.length < MAX_CAPTURES_PER_REQUEST) captures.push(value);
+          else captureOverflow++;
+        }
         return;
       }
       directives[key] = value;
@@ -213,18 +242,23 @@ export function parseHttpFile(source: string): ParseResult {
     }
 
     // Body is the rest, with leading/trailing blank lines stripped.
-    // `# @test ...` / `// @test ...` lines inside the body region are
-    // pulled out as test assertions and removed from the body so the
-    // request still serializes cleanly.
+    // `# @test ...` / `// @test ...` and `# @capture ...` /
+    // `// @capture ...` lines inside the body region are pulled out as
+    // assertions / captures and removed from the body so the request still
+    // serializes cleanly.
     const bodyLines: string[] = [];
     for (; i < section.end; i++) {
       const bl = lines[i];
       if (isCommentLine(bl)) {
         const stripped = bl.trimStart().replace(/^(#|\/\/)\s*/, '');
-        const m = stripped.match(/^@test(?:\s+(.+?))?\s*$/);
+        const m = stripped.match(/^@(test|capture)(?:\s+(.+?))?\s*$/);
         if (m) {
-          const expr = (m[1] ?? '').trim();
-          if (expr !== '') tests.push(expr);
+          const expr = (m[2] ?? '').trim();
+          if (expr !== '') {
+            if (m[1] === 'test') tests.push(expr);
+            else if (captures.length < MAX_CAPTURES_PER_REQUEST) captures.push(expr);
+            else captureOverflow++;
+          }
           continue;
         }
       }
@@ -241,6 +275,7 @@ export function parseHttpFile(source: string): ParseResult {
       body,
       directives,
       tests,
+      captures,
       requestLineIndex: reqLineIdx,
       startLine: section.start,
       endLine: section.end,
@@ -248,6 +283,15 @@ export function parseHttpFile(source: string): ParseResult {
     if (parsed.httpVersion !== undefined) req.httpVersion = parsed.httpVersion;
     if (section.name !== undefined) req.name = section.name;
     requests.push(req);
+    if (captureOverflow > 0) {
+      diagnostics.push({
+        line: reqLineIdx,
+        message:
+          `request declares more than ${MAX_CAPTURES_PER_REQUEST} capture directives: ` +
+          `kept the first ${MAX_CAPTURES_PER_REQUEST}, ignored ${captureOverflow} ` +
+          `(capture limit)`,
+      });
+    }
   }
 
   return { requests, diagnostics };

@@ -80,4 +80,51 @@ describe('requestToCurl', () => {
     expect(out).toContain('***REDACTED***');
     expect(out).not.toContain(`X-A: one`);
   });
+
+  // Issue #47 review S2: default cURL must match the canonical
+  // `redactSecretText` semantics — JSON-escaped forms and longest-first
+  // masking — or escaped secrets leak through to the clipboard.
+  it('masks the JSON-escaped form of a secret (GraphQL variable re-serialization)', () => {
+    const SECRET = 'sek' + 'r"et';
+    const escaped = JSON.stringify(SECRET).slice(1, -1); // sek\"ret
+    const out = requestToCurl(
+      {
+        method: 'POST',
+        url: 'https://example.com/gql',
+        headers: { 'content-type': 'application/json' },
+        // Body as it goes on the wire: the secret embedded escaped inside a
+        // JSON string value.
+        body: `{"query":"mutation { login(token: \\"${escaped}\\") }"}`,
+      },
+      { redact: [SECRET] },
+    );
+    expect(out).not.toContain(escaped);
+    expect(out).not.toContain(SECRET);
+    expect(out).toContain('***REDACTED***');
+  });
+
+  it('masks overlapping secrets longest-first with no longer-secret tail remnant', () => {
+    const out = requestToCurl(
+      {
+        method: 'POST',
+        url: 'https://example.com/x',
+        headers: {},
+        body: 'a=ovlap-longerval&b=ovlap',
+      },
+      { redact: ['ovlap', 'ovlap-longerval'] },
+    );
+    expect(out).not.toContain('ovlap');
+    expect(out).not.toContain('longerval');
+  });
+
+  it('masks a raw form that prefixes another secret\'s escaped form (G-R3 class)', () => {
+    const A = 'shared';
+    const B = 'shared"tail'; // escapes to shared\"tail
+    const out = requestToCurl(
+      { ...base, url: `https://example.com/q?d=${JSON.stringify(B).slice(1, -1)}&a=${A}` },
+      { redact: [A, B] },
+    );
+    expect(out).not.toContain('shared');
+    expect(out).not.toContain('tail');
+  });
 });

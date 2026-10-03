@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { assertInsideWorkspace } from '../core/pathGuard.js';
+import { SAMPLE_CHAIN_HTTP } from './sampleFiles.js';
 
 const SAMPLE_HTTP = `### hello
 # Edit, then click "Send Request" above the request line.
@@ -19,7 +20,9 @@ X-Request-Id: {{$guid}}
 
 const ENV_JSON = `{
   "default": {
-    "baseUrl": "https://httpbin.org"
+    "baseUrl": "https://httpbin.org",
+    "user": "alice",
+    "pass": { "$secret": true }
   },
   "local": {
     "baseUrl": "http://localhost:3000",
@@ -44,6 +47,7 @@ export async function initWorkspace(): Promise<void> {
   await vscode.workspace.fs.createDirectory(root);
   for (const [name, body] of [
     ['hello.http', SAMPLE_HTTP],
+    ['chain.http', SAMPLE_CHAIN_HTTP],
     ['.http-env.json', ENV_JSON],
     ['.gitignore', GITIGNORE],
   ] as const) {
