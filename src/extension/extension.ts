@@ -117,12 +117,14 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(treeView);
   let filterPickerGeneration = 0;
   let nameSearchPromptGeneration = 0;
+  let urlSearchPromptGeneration = 0;
 
   const updateRequestsTreeDescription = (): void => {
     const parts: string[] = [];
     const methodFilter = treeProvider.getMethodFilter();
     if (methodFilter) parts.push(`Method: ${methodFilter}`);
     if (treeProvider.hasNameSearchFilter()) parts.push('Name search active');
+    if (treeProvider.hasUrlSearchFilter()) parts.push('URL search active');
     treeView.description = parts.length > 0 ? parts.join(' • ') : undefined;
   };
 
@@ -187,6 +189,21 @@ export function activate(context: vscode.ExtensionContext): void {
       });
       if (generation !== nameSearchPromptGeneration || input === undefined) return;
       treeProvider.setNameFilter(input);
+      updateRequestsTreeDescription();
+    }),
+    vscode.commands.registerCommand('reqit.searchRequestsByUrl', async () => {
+      const generation = ++urlSearchPromptGeneration;
+      const input = await vscode.window.showInputBox({
+        title: 'Search requests by URL',
+        placeHolder: 'Literal HTTP URL text, without resolving variables (empty clears)',
+        password: true,
+        validateInput: (value: string) =>
+          value.length > REQUEST_NAME_SEARCH_MAX_LENGTH
+            ? `URL search must be ${REQUEST_NAME_SEARCH_MAX_LENGTH} characters or fewer.`
+            : undefined,
+      });
+      if (generation !== urlSearchPromptGeneration || input === undefined) return;
+      treeProvider.setUrlFilter(input);
       updateRequestsTreeDescription();
     }),
     vscode.commands.registerCommand('reqit.selectEnv', () => envManager.pickEnv()),

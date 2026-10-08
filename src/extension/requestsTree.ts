@@ -18,13 +18,29 @@ export class RequestsTreeProvider implements vscode.TreeDataProvider<RequestsNod
   // Presentation-only filters: never persisted, and never resolve secrets.
   private methodFilter: string | undefined;
   private nameSearchFilter: string | undefined;
+  private urlSearchFilter: string | undefined;
+
+  hasUrlSearchFilter(): boolean {
+    return this.urlSearchFilter !== undefined;
+  }
+
+  setUrlFilter(query: unknown): boolean {
+    if (query !== undefined && typeof query !== 'string') return false;
+    if (typeof query === 'string' && query.length > REQUEST_NAME_SEARCH_MAX_LENGTH) return false;
+    const normalized = query === undefined || query.length === 0 ? undefined : query.toLowerCase();
+    if (this.urlSearchFilter === normalized) return false;
+    this.urlSearchFilter = normalized;
+    this.refresh();
+    return true;
+  }
 
   setMethodFilter(method: unknown): boolean {
     if (
       method !== undefined &&
       (typeof method !== 'string' ||
         !(method === 'GRPC' || HTTP_METHODS.some((allowed) => allowed === method)))
-    ) return false;
+    )
+      return false;
     if (this.methodFilter === method) return false;
     this.methodFilter = method;
     this.refresh();
@@ -79,12 +95,17 @@ export class RequestsTreeProvider implements vscode.TreeDataProvider<RequestsNod
       // selections. Do not renumber nodes: their send anchors survive.
       const methodFilter = this.methodFilter;
       const nameSearchFilter = this.nameSearchFilter;
+      const urlSearchFilter = this.urlSearchFilter;
       const filtered = requests.filter(
         (request) =>
-          matchesMethodFilter(request, methodFilter) && matchesNameFilter(request, nameSearchFilter),
+          matchesMethodFilter(request, methodFilter) &&
+          matchesNameFilter(request, nameSearchFilter) &&
+          (urlSearchFilter === undefined ||
+            (request.kind === 'request' &&
+              request.request.url.toLowerCase().includes(urlSearchFilter))),
       );
       return requests.length > 0 && filtered.length === 0
-        ? [new MessageNode(noMatchMessage(methodFilter, nameSearchFilter))]
+        ? [new MessageNode(noMatchMessage(methodFilter, nameSearchFilter, urlSearchFilter))]
         : filtered;
     }
     return [];
@@ -113,12 +134,16 @@ function matchesNameFilter(request: RequestsNode, nameSearchFilter: string | und
 function noMatchMessage(
   methodFilter: string | undefined,
   nameSearchFilter: string | undefined,
+  urlSearchFilter: string | undefined,
 ): string {
-  if (methodFilter !== undefined && nameSearchFilter !== undefined) {
+  if ([methodFilter, nameSearchFilter, urlSearchFilter].filter((v) => v !== undefined).length > 1) {
     return 'No requests match current filters';
   }
   if (nameSearchFilter !== undefined) {
     return 'No requests match the active name search';
+  }
+  if (urlSearchFilter !== undefined) {
+    return 'No requests match the active URL search';
   }
   return 'No requests match the method filter';
 }
@@ -172,12 +197,7 @@ async function parseFileRequests(uri: vscode.Uri): Promise<RequestsNode[]> {
   return requests.map((r, i) => new RequestNode(uri, r, i));
 }
 
-export type RequestsNode =
-  | FolderNode
-  | FileNode
-  | RequestNode
-  | GrpcRequestNode
-  | MessageNode;
+export type RequestsNode = FolderNode | FileNode | RequestNode | GrpcRequestNode | MessageNode;
 
 class FolderNode {
   readonly kind = 'folder' as const;

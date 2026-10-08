@@ -357,9 +357,13 @@ describe('request explorer method filter', () => {
     provider.setNameFilter(sentinel);
     const grpcNodes = await provider.getChildren(grpcFile);
     const httpNodes = await provider.getChildren(httpFile);
-    expect(grpcNodes.map((node) => node.label)).toEqual(['No requests match the active name search']);
+    expect(grpcNodes.map((node) => node.label)).toEqual([
+      'No requests match the active name search',
+    ]);
     expect(grpcNodes[0].kind).toBe('message');
-    expect(httpNodes.map((node) => node.label)).toEqual(['No requests match the active name search']);
+    expect(httpNodes.map((node) => node.label)).toEqual([
+      'No requests match the active name search',
+    ]);
     expect(httpNodes[0].kind).toBe('message');
   });
 
@@ -427,7 +431,14 @@ describe('request explorer method filter', () => {
     const [file] = await provider.getChildren();
     provider.setNameFilter('list');
     host.fire.mockClear();
-    for (const input of [null, {}, ['list'], 1, true, 'x'.repeat(REQUEST_NAME_SEARCH_MAX_LENGTH + 1)]) {
+    for (const input of [
+      null,
+      {},
+      ['list'],
+      1,
+      true,
+      'x'.repeat(REQUEST_NAME_SEARCH_MAX_LENGTH + 1),
+    ]) {
       provider.setNameFilter(input);
       expect((await provider.getChildren(file)).map((node) => node.label)).toEqual(['List']);
     }
@@ -451,15 +462,19 @@ describe('request explorer method filter', () => {
   it('activation wires native input -> parser-backed name search with bounded validation', async () => {
     const view = { description: undefined as string | undefined };
     host.createTreeView.mockReturnValue(view);
-    host.showInputBox.mockImplementationOnce(async (options: { validateInput?: (value: string) => string | undefined }) => {
-      expect(options.title).toBe('Search requests by name');
-      expect(options.placeHolder).toBe('Case-insensitive literal match on ### request names (empty clears)');
-      expect(await options.validateInput?.('ok')).toBeUndefined();
-      expect(await options.validateInput?.('x'.repeat(REQUEST_NAME_SEARCH_MAX_LENGTH + 1))).toBe(
-        `Name search must be ${REQUEST_NAME_SEARCH_MAX_LENGTH} characters or fewer.`,
-      );
-      return 'cre';
-    });
+    host.showInputBox.mockImplementationOnce(
+      async (options: { validateInput?: (value: string) => string | undefined }) => {
+        expect(options.title).toBe('Search requests by name');
+        expect(options.placeHolder).toBe(
+          'Case-insensitive literal match on ### request names (empty clears)',
+        );
+        expect(await options.validateInput?.('ok')).toBeUndefined();
+        expect(await options.validateInput?.('x'.repeat(REQUEST_NAME_SEARCH_MAX_LENGTH + 1))).toBe(
+          `Name search must be ${REQUEST_NAME_SEARCH_MAX_LENGTH} characters or fewer.`,
+        );
+        return 'cre';
+      },
+    );
     activate({ subscriptions: [] } as unknown as ExtensionContext);
     const run: () => Promise<void> = host.registerCommand.mock.calls.find(
       ([name]) => name === 'reqit.searchRequestsByName',
@@ -492,7 +507,10 @@ describe('request explorer method filter', () => {
     host.showInputBox.mockResolvedValueOnce('');
     await run();
     expect(view.description).toBeUndefined();
-    expect((await provider.getChildren(file)).map((node) => node.label)).toEqual(['List', 'Create']);
+    expect((await provider.getChildren(file)).map((node) => node.label)).toEqual([
+      'List',
+      'Create',
+    ]);
   });
 
   it('does not let an older search prompt completion overwrite a newer one', async () => {
@@ -518,6 +536,124 @@ describe('request explorer method filter', () => {
     const [file] = await provider.getChildren();
     expect((await provider.getChildren(file)).map((node) => node.label)).toEqual(['Create']);
     expect(view.description).toBe('Name search active');
+  });
+
+  it('filters by literal URL text and composes with name and method without changing send targets', async () => {
+    host.readFile.mockResolvedValue(
+      new TextEncoder().encode(
+        [
+          '### Alpha',
+          'GET https://example.test/sentinel?token=private',
+          '',
+          '### Beta sentinel',
+          'POST https://example.test/other',
+          '',
+          '### Gamma',
+          'POST https://example.test/SENTINEL',
+          '',
+        ].join('\n'),
+      ),
+    );
+    const provider = new RequestsTreeProvider();
+    const [file] = await provider.getChildren();
+    const all = await provider.getChildren(file);
+    provider.setUrlFilter('sentinel');
+    expect((await provider.getChildren(file)).map((node) => node.label)).toEqual([
+      'Alpha',
+      'Gamma',
+    ]);
+    provider.setMethodFilter('POST');
+    expect((await provider.getChildren(file)).map((node) => node.toTreeItem().command)).toEqual([
+      all[2].toTreeItem().command,
+    ]);
+    provider.setNameFilter('alpha');
+    const disjoint = await provider.getChildren(file);
+    expect(disjoint.map((node) => node.label)).toEqual(['No requests match current filters']);
+    expect(disjoint[0].toTreeItem().command).toBeUndefined();
+    provider.setMethodFilter(undefined);
+    expect((await provider.getChildren(file)).map((node) => node.label)).toEqual(['Alpha']);
+    provider.setUrlFilter('');
+    expect((await provider.getChildren(file)).map((node) => node.label)).toEqual(['Alpha']);
+  });
+
+  it('searches only literal URLs, not names, headers, bodies or expanded variables', async () => {
+    const sentinel = 'urlonlysentinel';
+    const raw = `### ${sentinel}\nPOST https://example.test/{{endpoint}}\nx-search: ${sentinel}\n\n{"search":"${sentinel}"}`;
+    expect(raw).toContain(sentinel);
+    host.readFile.mockResolvedValue(new TextEncoder().encode(raw));
+    const provider = new RequestsTreeProvider();
+    const [file] = await provider.getChildren();
+    provider.setUrlFilter(sentinel);
+    expect((await provider.getChildren(file))[0].kind).toBe('message');
+    provider.setUrlFilter('{{endpoint}}');
+    expect((await provider.getChildren(file)).map((node) => node.label)).toEqual([sentinel]);
+  });
+
+  it('keeps URL search HTTP-only and ignores invalid or oversized input without reflecting it', async () => {
+    host.readDirectory.mockResolvedValue([
+      ['echo.grpc', 1],
+      ['items.http', 1],
+    ]);
+    host.readFile.mockImplementation(async (uri: { path: string }) =>
+      new TextEncoder().encode(
+        uri.path.endsWith('.grpc') ? 'GRPC example.test:50051/echo.Echo/Say\n\n{}' : source,
+      ),
+    );
+    const provider = new RequestsTreeProvider();
+    const [grpc, http] = await provider.getChildren();
+    provider.setUrlFilter('example.test');
+    expect((await provider.getChildren(grpc)).map((node) => node.label)).toEqual([
+      'No requests match the active URL search',
+    ]);
+    expect((await provider.getChildren(http)).map((node) => node.label)).toEqual([
+      'List',
+      'Create',
+    ]);
+    host.fire.mockClear();
+    for (const invalid of [null, {}, 10, 'x'.repeat(129)]) provider.setUrlFilter(invalid);
+    expect(host.fire).not.toHaveBeenCalled();
+    expect((await provider.getChildren(http)).map((node) => node.label)).toEqual([
+      'List',
+      'Create',
+    ]);
+  });
+
+  it('activation exposes bounded ephemeral URL search in the request explorer', async () => {
+    const view = { description: undefined as string | undefined };
+    host.createTreeView.mockReturnValue(view);
+    activate({ subscriptions: [] } as unknown as ExtensionContext);
+    const command = host.registerCommand.mock.calls.find(
+      ([name]) => name === 'reqit.searchRequestsByUrl',
+    );
+    expect(command).toBeDefined();
+    expect(manifest.contributes.menus['view/title']).toContainEqual({
+      command: 'reqit.searchRequestsByUrl',
+      when: 'view == reqit.requests',
+      group: 'navigation',
+    });
+    const run: () => Promise<void> = command![1];
+    host.showInputBox.mockImplementationOnce(
+      async (options: { validateInput: (s: string) => string | undefined; password: boolean }) => {
+        expect(options.password).toBe(true);
+        expect(options.validateInput('x'.repeat(129))).toBeDefined();
+        return 'items';
+      },
+    );
+    await run();
+    const provider: RequestsTreeProvider = host.createTreeView.mock.calls[0][1].treeDataProvider;
+    const [file] = await provider.getChildren();
+    expect((await provider.getChildren(file)).map((node) => node.label)).toEqual([
+      'List',
+      'Create',
+    ]);
+    expect(view.description).toBe('URL search active');
+    expect(view.description).not.toContain('items');
+    host.showInputBox.mockResolvedValueOnce(undefined);
+    await run();
+    expect(view.description).toBe('URL search active');
+    host.showInputBox.mockResolvedValueOnce('');
+    await run();
+    expect(view.description).toBeUndefined();
   });
 
   it('keeps method and name-search indicators accurate as each filter changes', async () => {
