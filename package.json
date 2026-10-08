@@ -149,6 +149,12 @@
         "icon": "$(search)"
       },
       {
+        "command": "reqit.searchRequestsByUrl",
+        "title": "Reqit: Search Requests by URL",
+        "category": "Reqit",
+        "icon": "$(link)"
+      },
+      {
         "command": "reqit.selectEnv",
         "title": "Reqit: Select Environment",
         "category": "Reqit"
@@ -202,6 +208,11 @@
         },
         {
           "command": "reqit.searchRequestsByName",
+          "when": "view == reqit.requests",
+          "group": "navigation"
+        },
+        {
+          "command": "reqit.searchRequestsByUrl",
           "when": "view == reqit.requests",
           "group": "navigation"
         },
