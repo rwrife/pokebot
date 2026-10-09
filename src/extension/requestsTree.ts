@@ -242,12 +242,13 @@ class RequestNode {
     readonly request: ParsedRequest,
     readonly index: number,
   ) {
-    this.label = request.name ?? `${request.method} ${shortUrl(request.url)}`;
+    // ponytail: unnamed requests show the method only; a URL can carry arbitrary secrets.
+    this.label = request.name ?? `${request.method} request`;
   }
   toTreeItem(): vscode.TreeItem {
     const item = new vscode.TreeItem(this.label, vscode.TreeItemCollapsibleState.None);
     item.description = `${this.request.method}`;
-    item.tooltip = `${this.request.method} ${this.request.url}`;
+    item.tooltip = `${this.request.method} request`;
     item.iconPath = new vscode.ThemeIcon('symbol-event');
     item.contextValue = 'reqit.request';
     item.command = {
@@ -307,9 +308,4 @@ class GrpcRequestNode {
     };
     return item;
   }
-}
-
-function shortUrl(url: string): string {
-  if (url.length <= 60) return url;
-  return url.slice(0, 57) + '...';
 }
