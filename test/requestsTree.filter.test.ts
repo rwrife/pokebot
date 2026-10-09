@@ -538,6 +538,36 @@ describe('request explorer method filter', () => {
     expect(view.description).toBe('Name search active');
   });
 
+  it('keeps credential-bearing URLs out of request labels and tooltips while retaining send anchors', async () => {
+    const sentinel = 'sensitive-url-secret';
+    const raw = [
+      `GET https://user:${sentinel}@example.test/items?token=${sentinel}`,
+      '',
+      '### Named',
+      `POST https://example.test/items?key=${sentinel}`,
+    ].join('\n');
+    expect(raw).toContain(sentinel);
+    host.readFile.mockResolvedValue(new TextEncoder().encode(raw));
+    const provider = new RequestsTreeProvider();
+    const [file] = await provider.getChildren();
+    const nodes = await provider.getChildren(file);
+    expect(nodes).toHaveLength(2);
+    for (const node of nodes) {
+      const item = node.toTreeItem();
+      expect(`${item.label} ${item.tooltip ?? ''} ${item.description ?? ''}`).not.toContain(sentinel);
+      expect(item.command).toMatchObject({ command: 'reqit.sendRequest' });
+      expect(item.command?.arguments?.[0]).toMatchObject({
+        requestLineIndex: node.kind === 'request' ? node.request.requestLineIndex : undefined,
+      });
+    }
+    expect(nodes.map((node) => node.label)).toEqual(['GET request', 'Named']);
+    expect(nodes[0].kind === 'request' && nodes[0].request.url).toBe(
+      `https://user:${sentinel}@example.test/items?token=${sentinel}`,
+    );
+    provider.setUrlFilter('items');
+    expect((await provider.getChildren(file)).map((node) => node.label)).toEqual(['GET request', 'Named']);
+  });
+
   it('filters by literal URL text and composes with name and method without changing send targets', async () => {
     host.readFile.mockResolvedValue(
       new TextEncoder().encode(
