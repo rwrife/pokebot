@@ -34,10 +34,7 @@ import { initWorkspace } from './initWorkspace.js';
 import { importFromCurlCommand } from './importCurl.js';
 import { importFromPostmanCommand } from './importPostman.js';
 import { importFromOpenApiCommand } from './importOpenapi.js';
-import {
-  REQUEST_NAME_SEARCH_MAX_LENGTH,
-  RequestsTreeProvider,
-} from './requestsTree.js';
+import { REQUEST_NAME_SEARCH_MAX_LENGTH, RequestsTreeProvider } from './requestsTree.js';
 import { EnvManager } from './envManager.js';
 import { buildGrpcCodeLenses, parseGrpcFile } from '../core/grpc.js';
 
@@ -142,6 +139,20 @@ export function activate(context: vscode.ExtensionContext): void {
     watcher.onDidChange(() => treeProvider.refresh());
     watcher.onDidDelete(() => treeProvider.refresh());
     context.subscriptions.push(watcher);
+    const requestFile = (uri: vscode.Uri): boolean =>
+      uri.scheme === folder.uri.scheme &&
+      uri.authority === folder.uri.authority &&
+      uri.path.startsWith(`${folder.uri.path.replace(/\/$/, '')}/.requests/`) &&
+      /\.(http|grpc)$/i.test(uri.path);
+    context.subscriptions.push(
+      vscode.workspace.onDidChangeTextDocument((event) => {
+        if (event.contentChanges.length > 0 && requestFile(event.document.uri))
+          treeProvider.refresh();
+      }),
+      vscode.workspace.onDidCloseTextDocument((document) => {
+        if (requestFile(document.uri)) treeProvider.refresh();
+      }),
+    );
   }
 
   context.subscriptions.push(
@@ -271,8 +282,7 @@ export function activate(context: vscode.ExtensionContext): void {
         // closure while secrets are in play, mirroring runRequest (issue #47
         // review r7 SEC1 + r9): either state means the redaction set may be
         // missing the exact derived value that reached the wire.
-        const hasSecretCandidates =
-          chained.resolvedSecrets.length > 0 || secretValues.length > 0;
+        const hasSecretCandidates = chained.resolvedSecrets.length > 0 || secretValues.length > 0;
         if (hasSecretCandidates && (substituted.injectedOverflow || copyClosure.truncated)) {
           vscode.window.showErrorMessage(
             'Reqit: too many substitutions to guarantee secret redaction — copy blocked. Reduce templated references (over 1000 recorded substitutions or over-bound secret template expansions) and try again.',
@@ -360,9 +370,7 @@ export function activate(context: vscode.ExtensionContext): void {
           (d) => d.line === arg.requestLineIndex && d.message.includes('capture limit'),
         );
         if (parseDiags.length > 0) {
-          vscode.window.showWarningMessage(
-            `Reqit: ${parseDiags.map((d) => d.message).join('; ')}`,
-          );
+          vscode.window.showWarningMessage(`Reqit: ${parseDiags.map((d) => d.message).join('; ')}`);
         }
         await runRequest(context, req, envManager);
       },
@@ -525,9 +533,7 @@ async function runRequest(
   );
   if (substituted.diagnostics.length > 0) {
     const names = [...new Set(substituted.diagnostics.map((d) => d.variable))].join(', ');
-    vscode.window.showErrorMessage(
-      `Reqit: unresolved variables (${envManager.active}): ${names}`,
-    );
+    vscode.window.showErrorMessage(`Reqit: unresolved variables (${envManager.active}): ${names}`);
     return;
   }
   const requestForUndici: ParsedRequest = {
@@ -600,14 +606,9 @@ async function runRequest(
     ...opts,
     url: redactSecretText(opts.url, renderSecrets),
     headers: Object.fromEntries(
-      Object.entries(opts.headers).map(([k, v]) => [
-        k,
-        redactSecretText(String(v), renderSecrets),
-      ]),
+      Object.entries(opts.headers).map(([k, v]) => [k, redactSecretText(String(v), renderSecrets)]),
     ),
-    ...(opts.body !== undefined
-      ? { body: redactSecretText(opts.body, renderSecrets) }
-      : {}),
+    ...(opts.body !== undefined ? { body: redactSecretText(opts.body, renderSecrets) } : {}),
   };
 
   // Dynamic import — keeps activation cheap and avoids bundling undici into the activation path.
@@ -625,7 +626,10 @@ async function runRequest(
       signal: stream.signal,
     });
     const responseHeaders: Record<string, string> = Object.fromEntries(
-      Object.entries(res.headers).map(([k, v]) => [k, Array.isArray(v) ? v.join(', ') : String(v ?? '')]),
+      Object.entries(res.headers).map(([k, v]) => [
+        k,
+        Array.isArray(v) ? v.join(', ') : String(v ?? ''),
+      ]),
     );
     // Recorded request bodies are scrubbed with the SAME redaction set the
     // render echo uses (issue #47 review F1-R3): the store outlives the
@@ -649,13 +653,12 @@ async function runRequest(
       // the exchange with an empty body so at least `{{name.response.status}}`
       // and header references resolve downstream. Event-level capture is
       // outside this slice.
-      const sseRecord = recordChainExchange(
-        chainStore,
-        chainName,
-        req.captures,
-        recordedBody,
-        { received: true, status: res.statusCode, headers: responseHeaders, body: '' },
-      );
+      const sseRecord = recordChainExchange(chainStore, chainName, req.captures, recordedBody, {
+        received: true,
+        status: res.statusCode,
+        headers: responseHeaders,
+        body: '',
+      });
       reportCaptureDiagnostics(sseRecord.diagnostics);
       // The TRANSPORT keeps the real wire `opts` (reconnects replay it —
       // secrets must survive there); only the VIEW copy is redacted
@@ -675,13 +678,12 @@ async function runRequest(
     }
     const bodyText = await res.body.text();
     const elapsedMs = Date.now() - started;
-    const exchangeRecord = recordChainExchange(
-      chainStore,
-      chainName,
-      req.captures,
-      recordedBody,
-      { received: true, status: res.statusCode, headers: responseHeaders, body: bodyText },
-    );
+    const exchangeRecord = recordChainExchange(chainStore, chainName, req.captures, recordedBody, {
+      received: true,
+      status: res.statusCode,
+      headers: responseHeaders,
+      body: bodyText,
+    });
     reportCaptureDiagnostics(exchangeRecord.diagnostics);
     renderResponse(context, {
       request: renderRequest,
@@ -753,9 +755,10 @@ async function streamSseResponse(
   const events: SseRenderEvent[] = [];
   const transcriptRecords: SseTranscriptRecord[] = [];
   lastSseTranscript = undefined;
-  const initialNote = directives.diagnostics.length > 0
-    ? `SSE directives ignored: ${directives.diagnostics.map((d) => `${d.directive} (${d.message})`).join('; ')}`
-    : undefined;
+  const initialNote =
+    directives.diagnostics.length > 0
+      ? `SSE directives ignored: ${directives.diagnostics.map((d) => `${d.directive} (${d.message})`).join('; ')}`
+      : undefined;
   const state: SseRenderState = {
     request: requestForView,
     status: res.statusCode,
@@ -796,20 +799,19 @@ async function streamSseResponse(
     destroyBodyOnStop(res.body);
   });
 
-  const decodeBody = (
-    body: AsyncIterable<Uint8Array | string>,
-  ): AsyncIterable<string> => (async function* (): AsyncGenerator<string> {
-    const decoder = new TextDecoder('utf-8');
-    for await (const chunk of body) {
-      if (typeof chunk === 'string') {
-        yield chunk;
-      } else {
-        yield decoder.decode(chunk, { stream: true });
+  const decodeBody = (body: AsyncIterable<Uint8Array | string>): AsyncIterable<string> =>
+    (async function* (): AsyncGenerator<string> {
+      const decoder = new TextDecoder('utf-8');
+      for await (const chunk of body) {
+        if (typeof chunk === 'string') {
+          yield chunk;
+        } else {
+          yield decoder.decode(chunk, { stream: true });
+        }
       }
-    }
-    const tail = decoder.decode();
-    if (tail.length > 0) yield tail;
-  })();
+      const tail = decoder.decode();
+      if (tail.length > 0) yield tail;
+    })();
 
   let usedInitialResponse = false;
   const { request } = await import('undici');
@@ -832,12 +834,16 @@ async function streamSseResponse(
         // instead of resolving later with an orphaned body.
         signal: stream.signal,
       });
-      if (!isSseResponse(reconnectResponse.headers as Record<string, string | string[] | undefined>)) {
+      if (
+        !isSseResponse(reconnectResponse.headers as Record<string, string | string[] | undefined>)
+      ) {
         const contentType = reconnectResponse.headers['content-type'];
         const contentTypeText = Array.isArray(contentType)
           ? contentType.join(', ')
           : String(contentType ?? 'unknown');
-        throw new Error(`SSE reconnect response is not event-stream (content-type=${contentTypeText})`);
+        throw new Error(
+          `SSE reconnect response is not event-stream (content-type=${contentTypeText})`,
+        );
       }
       state.status = reconnectResponse.statusCode;
       state.headers = Object.fromEntries(
@@ -891,7 +897,9 @@ async function streamSseResponse(
       handle.update({ ...state, events: [...events] });
     },
     ...(directives.options.until !== undefined ? { until: directives.options.until } : {}),
-    ...(directives.options.maxEvents !== undefined ? { maxEvents: directives.options.maxEvents } : {}),
+    ...(directives.options.maxEvents !== undefined
+      ? { maxEvents: directives.options.maxEvents }
+      : {}),
     ...(directives.options.maxDurationMs !== undefined
       ? { maxDurationMs: directives.options.maxDurationMs }
       : {}),

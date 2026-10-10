@@ -11,9 +11,14 @@ const host = vi.hoisted(() => ({
   showInputBox: vi.fn(),
   registerCommand: vi.fn(),
   createTreeView: vi.fn(),
+  onDidChangeTextDocument: vi.fn(),
+  onDidCloseTextDocument: vi.fn(),
+  textDocuments: [] as { uri: { toString(): string }; getText(): string }[],
 }));
 vi.mock('vscode', () => {
   class Uri {
+    readonly scheme = 'file';
+    readonly authority = '';
     constructor(readonly path: string) {}
     toString() {
       return `file://${this.path}`;
@@ -51,6 +56,11 @@ vi.mock('vscode', () => {
     },
     languages: { registerCodeLensProvider: vi.fn() },
     workspace: {
+      get textDocuments() {
+        return host.textDocuments;
+      },
+      onDidChangeTextDocument: host.onDidChangeTextDocument,
+      onDidCloseTextDocument: host.onDidCloseTextDocument,
       createFileSystemWatcher: () => ({ onDidCreate() {}, onDidChange() {}, onDidDelete() {} }),
       workspaceFolders: [{ uri: new Uri('/workspace') }],
       fs: { readFile: host.readFile, readDirectory: host.readDirectory, stat: host.stat },
@@ -80,6 +90,115 @@ beforeEach(() => {
   host.stat.mockResolvedValue({ type: 2 });
   host.readDirectory.mockResolvedValue([['items.http', 1]]);
   host.readFile.mockResolvedValue(new TextEncoder().encode(source));
+  host.textDocuments = [];
+});
+
+describe('request explorer open editor consistency', () => {
+  it('uses the unsaved editor text for explorer children and preserves send anchors', async () => {
+    const provider = new RequestsTreeProvider();
+    const [file] = await provider.getChildren();
+    const uri = file.kind === 'file' ? file.uri : undefined;
+    expect(uri).toBeDefined();
+    host.textDocuments = [
+      {
+        uri: uri!,
+        getText: () => '### Draft\nPATCH https://example.test/edited\n',
+      },
+    ];
+    const children = await provider.getChildren(file);
+    expect(children.map((node) => node.label)).toEqual(['Draft']);
+    expect(children[0].toTreeItem().command).toMatchObject({
+      command: 'reqit.sendRequest',
+      arguments: [{ documentUri: uri!.toString(), requestLineIndex: 1 }],
+    });
+    expect(host.readFile).not.toHaveBeenCalled();
+  });
+
+  it('prefers an editor opened during a pending disk read', async () => {
+    const provider = new RequestsTreeProvider();
+    const [file] = await provider.getChildren();
+    let complete!: (value: Uint8Array) => void;
+    host.readFile.mockImplementationOnce(
+      () =>
+        new Promise<Uint8Array>((resolve) => {
+          complete = resolve;
+        }),
+    );
+    const reading = provider.getChildren(file);
+    host.textDocuments = [
+      {
+        uri: file.kind === 'file' ? file.uri : { toString: () => '' },
+        getText: () => '### New\nPOST https://example.test/new\n',
+      },
+    ];
+    complete(new TextEncoder().encode(source));
+    expect((await reading).map((node) => node.label)).toEqual(['New']);
+  });
+
+  it('ignores an unrelated open editor and reads only the selected file', async () => {
+    const provider = new RequestsTreeProvider();
+    const [file] = await provider.getChildren();
+    host.textDocuments = [
+      {
+        uri: { toString: () => 'file:///workspace/.requests/other.http' },
+        getText: () => '### Outside\nDELETE https://example.test/outside',
+      },
+    ];
+    expect((await provider.getChildren(file)).map((node) => node.label)).toEqual([
+      'List',
+      'Create',
+    ]);
+    expect(host.readFile).toHaveBeenCalledOnce();
+  });
+
+  it('uses open gRPC editor text without reading a stale file', async () => {
+    host.readDirectory.mockResolvedValue([['test.grpc', 1]]);
+    const provider = new RequestsTreeProvider();
+    const [file] = await provider.getChildren();
+    host.textDocuments = [
+      {
+        uri: file.kind === 'file' ? file.uri : { toString: () => '' },
+        getText: () => '### Unsaved\nGRPC localhost:50051/example.Echo/Say\n\n{}',
+      },
+    ];
+    const [child] = await provider.getChildren(file);
+    expect(child.label).toBe('Unsaved');
+    expect(child.toTreeItem().command).toMatchObject({ command: 'reqit.sendGrpcRequest' });
+    expect(host.readFile).not.toHaveBeenCalled();
+  });
+
+  it('refreshes on document edits and close so disk and editor views do not diverge', () => {
+    host.onDidChangeTextDocument.mockReturnValue({ dispose() {} });
+    host.onDidCloseTextDocument.mockReturnValue({ dispose() {} });
+    host.createTreeView.mockReturnValue({});
+    const subscriptions: { dispose(): void }[] = [];
+    activate({ subscriptions } as unknown as ExtensionContext);
+    const onChange = host.onDidChangeTextDocument.mock.calls[0]?.[0];
+    const onClose = host.onDidCloseTextDocument.mock.calls[0]?.[0];
+    expect(onChange).toBeTypeOf('function');
+    expect(onClose).toBeTypeOf('function');
+    const uri = { path: '/workspace/.requests/items.http', scheme: 'file', authority: '' };
+    host.fire.mockClear();
+    onChange({ document: { uri }, contentChanges: [{}] });
+    onClose({ uri });
+    expect(host.fire).toHaveBeenCalledTimes(2);
+    host.fire.mockClear();
+    onChange({ document: { uri }, contentChanges: [] });
+    for (const path of [
+      '/workspace/other.http',
+      '/workspace/.requests-other/items.http',
+      '/workspace/.requests/notes.txt',
+      '/other/.requests/items.http',
+    ]) {
+      onChange({ document: { uri: { ...uri, path } }, contentChanges: [{}] });
+      onClose({ uri: { ...uri, path } });
+    }
+    onClose({ uri: { ...uri, scheme: 'other' } });
+    onClose({ uri: { ...uri, authority: 'other' } });
+    expect(host.fire).not.toHaveBeenCalled();
+    expect(subscriptions).toContain(host.onDidChangeTextDocument.mock.results[0].value);
+    expect(subscriptions).toContain(host.onDidCloseTextDocument.mock.results[0].value);
+  });
 });
 
 describe('request explorer method filter', () => {
@@ -554,7 +673,9 @@ describe('request explorer method filter', () => {
     expect(nodes).toHaveLength(2);
     for (const node of nodes) {
       const item = node.toTreeItem();
-      expect(`${item.label} ${item.tooltip ?? ''} ${item.description ?? ''}`).not.toContain(sentinel);
+      expect(`${item.label} ${item.tooltip ?? ''} ${item.description ?? ''}`).not.toContain(
+        sentinel,
+      );
       expect(item.command).toMatchObject({ command: 'reqit.sendRequest' });
       expect(item.command?.arguments?.[0]).toMatchObject({
         requestLineIndex: node.kind === 'request' ? node.request.requestLineIndex : undefined,
@@ -565,7 +686,10 @@ describe('request explorer method filter', () => {
       `https://user:${sentinel}@example.test/items?token=${sentinel}`,
     );
     provider.setUrlFilter('items');
-    expect((await provider.getChildren(file)).map((node) => node.label)).toEqual(['GET request', 'Named']);
+    expect((await provider.getChildren(file)).map((node) => node.label)).toEqual([
+      'GET request',
+      'Named',
+    ]);
   });
 
   it('filters by literal URL text and composes with name and method without changing send targets', async () => {
