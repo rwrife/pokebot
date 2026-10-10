@@ -182,13 +182,19 @@ async function listDir(uri: vscode.Uri): Promise<RequestsNode[]> {
 }
 
 async function parseFileRequests(uri: vscode.Uri): Promise<RequestsNode[]> {
-  let bytes: Uint8Array;
-  try {
-    bytes = await vscode.workspace.fs.readFile(uri);
-  } catch {
-    return [];
+  const openText = (): string | undefined =>
+    vscode.workspace.textDocuments.find((doc) => doc.uri.toString() === uri.toString())?.getText();
+  let text = openText();
+  if (text === undefined) {
+    try {
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      // An editor may open or change while the disk read is pending.
+      text = openText() ?? new TextDecoder().decode(bytes);
+    } catch {
+      text = openText();
+      if (text === undefined) return [];
+    }
   }
-  const text = new TextDecoder().decode(bytes);
   if (/\.grpc$/i.test(uri.path)) {
     const { requests } = parseGrpcFile(text);
     return requests.map((r, i) => new GrpcRequestNode(uri, r, i));
